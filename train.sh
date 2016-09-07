@@ -44,7 +44,8 @@ if [ ! -f multi-bleu.perl ]; then
     curl -s $mose_git/generic/multi-bleu.perl > multi-bleu.perl
 fi
 
-echo 'please put the parallel corpus in the data directory'
+echo 'please download corresponding datasets from WMT15 manually'
+echo 'and put the parallel corpus in the data directory'
 echo 'then enter the file name of source language dataset'
 read -p '==> ' source_data
 echo 'the file name of target language dataset'
@@ -112,7 +113,7 @@ read -p '==>' trg_vocab_size
 python create_vocab.py $source_language $target_language $src_vocab_size $trg_vocab_size $tok_source_file.shuf $tok_target_file.shuf
 
 cd ..
-if [ -f configuration.py ]; then
+if [ -f configurations.py ]; then
     cp configurations.py configurations_backup.py
 fi 
 

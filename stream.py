@@ -8,7 +8,6 @@ from fuel.transformers import (
 
 import pickle
 import configurations
-from itertools import chain
 
 
 def _ensure_special_tokens(vocab, bos_idx=0, eos_idx=0, unk_idx=1):
@@ -82,8 +81,13 @@ class PaddingWithEOS(Padding):
             if source not in self.mask_sources:
                 batch_with_masks.append(source_batch)
                 continue
-            word_shapes = [sum(numpy.asarray(sample) == self.space_idx[source]) for sample in source_batch]
-            shapes = [numpy.asarray(sample).shape for sample in source_batch]
+            word_shapes = [0] * len(source_batch)
+            shapes = [0] * len(source_batch)
+            for i, sample in enumerate(source_batch):
+                np_sample = numpy.asarray(sample)
+                word_shapes[i] = numpy.count_nonzero(np_sample == self.space_idx[source])
+                shapes[i] = np_sample.shape
+
             lengths = [shape[0] for shape in shapes]
             max_word_len = max(word_shapes)
             add_space_length = []
@@ -104,13 +108,14 @@ class PaddingWithEOS(Padding):
 
             sample_matrix = numpy.zeros((len(source_batch), max_word_len, max_char_seq_length),
                                         dtype=self.mask_dtype)
+            char_seq_space_index = char_seq == self.space_idx[source]
 
-            for i, sample in enumerate(char_seq):
+            for i in range(len(source_batch)):
                 sample_matrix[i, range(max_word_len),
-                              numpy.where(sample == self.space_idx[source])[0] - 1] = 1
+                              numpy.where(char_seq_space_index[i])[0] - 1] = 1
 
             char_aux = numpy.ones((len(source_batch), max_char_seq_length), self.mask_dtype)
-            char_aux[char_seq == self.space_idx[source]] = 0
+            char_aux[char_seq_space_index] = 0
 
             word_mask = numpy.zeros((len(source_batch), max_word_len), self.mask_dtype)
             for i, ws in enumerate(word_shapes):
@@ -133,21 +138,18 @@ class PaddingWithEOS(Padding):
                 target_prev_char_aux[:, 0] = 0
                 target_resample_matrix = numpy.zeros((len(source_batch), max_char_seq_length, max_word_len),
                                                      dtype=self.mask_dtype)
-                for i, sample in enumerate(char_seq):
-                    space_idx = numpy.where(sample == self.space_idx[source])[0]
-                    roll_space_idx = numpy.roll(space_idx, 1)
-                    roll_space_idx[0] = -1
-                    index_x = [x for x in chain.from_iterable([range(roll_space_idx[i] + 1, space_idx[i] + 1)
-                                                               for i in range(len(space_idx))])]
-                    index_y = [x for x in chain.from_iterable([list([i] * l)
-                                                               for i, l in enumerate(space_idx - roll_space_idx)])]
-                    target_resample_matrix[i, index_x, index_y] = 1
+
+                curr_space_idx = numpy.where(char_seq_space_index)
+                for i in range(len(source_batch)):
+                    pj = 0
+                    for cj in range(max_word_len):
+                        target_resample_matrix[i, pj:curr_space_idx[1][i * max_word_len + cj] + 1, cj] = 1
+                        pj = curr_space_idx[1][i * max_word_len + cj] + 1
 
                 batch_with_masks.append(target_char_mask)
                 batch_with_masks.append(target_resample_matrix)
                 batch_with_masks.append(target_prev_char_seq)
                 batch_with_masks.append(target_prev_char_aux)
-
         return tuple(batch_with_masks)
 
 
@@ -170,23 +172,28 @@ class _oov_to_unk(object):
 class _too_long(object):
     """Filters sequences longer than given sequence length."""
 
-    def __init__(self, unk_id, space_idx, seq_char_len=300, seq_word_len=50):
+    def __init__(self, unk_id, space_idx, max_src_seq_char_len, max_src_seq_word_len,
+                 max_trg_seq_char_len, max_trg_seq_word_len):
         self.unk_id = unk_id
-        self.seq_char_len = seq_char_len
-        self.seq_word_len = seq_word_len
+        self.max_src_seq_char_len = max_src_seq_char_len
+        self.max_src_seq_word_len = max_src_seq_word_len
+        self.max_trg_seq_char_len = max_trg_seq_char_len
+        self.max_trg_seq_word_len = max_trg_seq_word_len
         self.space_idx = space_idx
 
     def __call__(self, sentence_pair):
         max_unk = 5
-        return all([len(sentence_pair[0]) <= self.seq_char_len and sentence_pair[0].count(self.unk_id) < max_unk and
-                    sentence_pair[0].count(self.space_idx[0]) < self.seq_word_len,
-                    len(sentence_pair[1]) <= self.seq_char_len and sentence_pair[1].count(self.unk_id) < max_unk and
-                    sentence_pair[1].count(self.space_idx[1]) < self.seq_word_len])
+        return all(
+            [len(sentence_pair[0]) <= self.max_src_seq_char_len and sentence_pair[0].count(self.unk_id) < max_unk and
+             sentence_pair[0].count(self.space_idx[0]) < self.max_src_seq_word_len,
+             len(sentence_pair[1]) <= self.max_trg_seq_char_len and sentence_pair[1].count(self.unk_id) < max_unk and
+             sentence_pair[1].count(self.space_idx[1]) < self.max_trg_seq_word_len])
 
 
 def get_tr_stream(src_vocab, trg_vocab, src_data, trg_data,
-                  src_vocab_size=120, trg_vocab_size=120, unk_id=1, bos_token='<S>', seq_char_len=300,
-                  seq_word_len=50, batch_size=70, sort_k_batches=12, **kwargs):
+                  src_vocab_size=120, trg_vocab_size=120, unk_id=1, bos_token='<S>', max_src_seq_char_len=300,
+                  max_src_seq_word_len=50, max_trg_seq_char_len=300, max_trg_seq_word_len=50,
+                  batch_size=80, sort_k_batches=12, **kwargs):
     """Prepares the training data stream."""
 
     # Load dictionaries and ensure special tokens exist
@@ -210,9 +217,9 @@ def get_tr_stream(src_vocab, trg_vocab, src_data, trg_data,
                    ('source', 'target'))
 
     # Filter sequences that are too long
-    stream = Filter(stream,
-                    predicate=_too_long(unk_id=unk_id, space_idx=[src_vocab[' '], trg_vocab[' ']],
-                                        seq_char_len=seq_char_len, seq_word_len=seq_word_len))
+    stream = Filter(stream, predicate=_too_long(unk_id, [src_vocab[' '], trg_vocab[' ']],
+                                                max_src_seq_char_len, max_src_seq_word_len,
+                                                max_trg_seq_char_len, max_trg_seq_word_len))
 
     # Replace out of vocabulary tokens with unk token
     stream = Mapping(stream,

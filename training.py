@@ -1,4 +1,5 @@
 import logging
+import sys
 
 from collections import Counter
 
@@ -49,11 +50,12 @@ def main(config, tr_stream, dev_stream):
     # Construct model
     logger.info('Building RNN encoder-decoder')
 
-    encoder = BidirectionalEncoder(config['src_vocab_size'], config['enc_embed'], config['char_enc_nhids'],
-                                   config['enc_nhids'], config['encoder_layers'])
+    encoder = BidirectionalEncoder(config['src_vocab_size'], config['enc_embed'], config['src_dgru_nhids'],
+                                   config['enc_nhids'], config['src_dgru_depth'], config['bidir_encoder_depth'])
 
-    decoder = Decoder(config['trg_vocab_size'], config['dec_embed'], config['char_dec_nhids'], config['dec_nhids'],
-                      config['enc_nhids'] * 2, config['transition_layers'], target_space_idx, target_bos_idx)
+    decoder = Decoder(config['trg_vocab_size'], config['dec_embed'], config['trg_dgru_nhids'], config['trg_igru_nhids'],
+                      config['dec_nhids'], config['enc_nhids'] * 2, config['transition_depth'], config['trg_igru_depth'],
+                      config['trg_dgru_depth'], target_space_idx, target_bos_idx)
 
     representation = encoder.apply(source_char_seq, source_sample_matrix, source_char_aux,
                                    source_word_mask)
@@ -71,28 +73,22 @@ def main(config, tr_stream, dev_stream):
     encoder.biases_init = decoder.biases_init = Constant(0)
     encoder.push_initialization_config()
     decoder.push_initialization_config()
-    for layer_n in range(config['encoder_layers']):
+    for layer_n in range(config['src_dgru_depth']):
         encoder.decimator.dgru.transitions[layer_n].weights_init = Orthogonal()
+    for layer_n in range(config['bidir_encoder_depth']):
         encoder.children[1 + layer_n].prototype.recurrent.weights_init = Orthogonal()
-    decoder.interpolator.igru.weights_init = Orthogonal()
-    decoder.interpolator.feedback_brick.dgru.transitions[0].weights_init = Orthogonal()
-    for layer_n in range(config['transition_layers']):
+    if config['trg_igru_depth'] == 1:
+        decoder.interpolator.igru.weights_init = Orthogonal()
+    else:
+        for layer_n in range(config['trg_igru_depth']):
+            decoder.interpolator.igru.transitions[layer_n].weights_init = Orthogonal()
+    for layer_n in range(config['trg_dgru_depth']):
+        decoder.interpolator.feedback_brick.dgru.transitions[layer_n].weights_init = Orthogonal()
+    for layer_n in range(config['transition_depth']):
         decoder.transition.transitions[layer_n].weights_init = Orthogonal()
     encoder.initialize()
     decoder.initialize()
 
-    # Apply weight noise for regularization
-    if config['weight_noise_ff'] > 0.0:
-        logger.info('Applying weight noise to ff layers')
-        enc_params = Selector(encoder.lookup).get_params().values()
-        enc_params += Selector(encoder.fwd_fork).get_params().values()
-        enc_params += Selector(encoder.back_fork).get_params().values()
-        dec_params = Selector(
-            decoder.sequence_generator.readout).get_params().values()
-        dec_params += Selector(
-            decoder.sequence_generator.fork).get_params().values()
-        dec_params += Selector(decoder.state_init).get_params().values()
-        cg = apply_noise(cg, enc_params + dec_params, config['weight_noise_ff'])
 
     # Print shapes
     shapes = [param.get_value().shape for param in cg.parameters]
@@ -130,7 +126,7 @@ def main(config, tr_stream, dev_stream):
                               before_first_epoch=True, prefix='tra')
     extensions = [
         train_monitor, Timing(),
-        Printing(after_batch=True),
+        Printing(every_n_batches=config['print_freq']),
         FinishAfter(after_n_batches=config['finish_after']),
         CheckpointNMT(config['saveto'], every_n_batches=config['save_freq'])]
 
@@ -141,14 +137,14 @@ def main(config, tr_stream, dev_stream):
         search_model = Model(generated)
         _, samples = VariableFilter(
             bricks=[decoder.sequence_generator], name="outputs")(
-            ComputationGraph(generated[config['transition_layers']]))  # generated[transition_layers] is next_outputs
+            ComputationGraph(generated[config['transition_depth']]))  # generated[transition_depth] is next_outputs
 
     # Add sampling
     if config['hook_samples'] >= 1:
         logger.info("Building sampler")
         extensions.append(
             Sampler(model=search_model, data_stream=tr_stream,
-                    hook_samples=config['hook_samples'], transition_layers=config['transition_layers'],
+                    hook_samples=config['hook_samples'], transition_depth=config['transition_depth'],
                     every_n_batches=config['sampling_freq'], src_vocab_size=config['src_vocab_size']))
 
     # Add early stopping based on bleu
@@ -179,6 +175,7 @@ def main(config, tr_stream, dev_stream):
 
 
 if __name__ == "__main__":
+    assert sys.version_info >= (3,4)
     # Get configurations for model
     configuration = configurations.get_config()
     logger.info("Model options:\n{}".format(pprint.pformat(configuration)))

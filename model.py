@@ -13,7 +13,7 @@ from blocks.roles import add_role, WEIGHT
 from blocks.utils import shared_floatx_nans, dict_subset, dict_union
 from theano import tensor
 from toolz import merge
-
+from blocks.bricks.recurrent.misc import RECURRENTSTACK_SEPARATOR
 
 # Helper class
 class InitializableFeedforwardSequence(FeedforwardSequence, Initializable):
@@ -44,7 +44,7 @@ class DGRU(GatedRecurrent):
             shape (batch_size, 2 * dim).
         mask : :class:`~tensor.TensorVariable`
             A 1D binary array in the shape (batch,) which is 1 if there is
-            data available, 0 if not. Assumed to be 1-s only if not given.
+            the charater available, 0 if there is the delimiter.
         Returns
         -------
         output : :class:`~tensor.TensorVariable`
@@ -66,9 +66,9 @@ class DGRU(GatedRecurrent):
 
 
 class Decimator(Initializable):
-    """Char encoder, mapping a char-level word to a vector"""
+    """Char encoder, mapping a charater-level word to a vector"""
 
-    def __init__(self, vocab_size, embedding_dim, dgru_state_dim, dgru_layers, **kwargs):
+    def __init__(self, vocab_size, embedding_dim, dgru_state_dim, dgru_depth, **kwargs):
         super(Decimator, self).__init__(**kwargs)
 
         self.vocab_size = vocab_size
@@ -76,8 +76,8 @@ class Decimator(Initializable):
         self.dgru_state_dim = dgru_state_dim
         self.embedding_dim = embedding_dim
         self.lookup = LookupTable(name='embeddings')
-        self.dgru_layers = dgru_layers
-        self.dgru = RecurrentStack([DGRU(activation=Tanh(), dim=self.dgru_state_dim) for _ in range(dgru_layers)],
+        self.dgru_depth = dgru_depth
+        self.dgru = RecurrentStack([DGRU(activation=Tanh(), dim=self.dgru_state_dim) for _ in range(dgru_depth)],
                                    skip_connections=True)
 
         self.gru_fork = Fork([name for name in self.dgru.apply.sequences
@@ -101,22 +101,28 @@ class Decimator(Initializable):
         gru_out = self.dgru.apply(
             **merge(self.gru_fork.apply(embeddings, as_dict=True),
                     {'mask': char_aux}))
-        if self.dgru_layers > 1:
+        if self.dgru_depth > 1:
             gru_out = gru_out[-1]
         sampled_representation = tensor.batched_dot(sample_matrix, gru_out.dimshuffle([1, 0, 2]))
         return sampled_representation.dimshuffle([1, 0, 2])
 
-    @application(inputs=['target_single_char'],
-                 outputs=['gru_out'])
+    @application(inputs=['target_single_char'])
     def single_emit(self, target_single_char, batch_size, mask, states=None):
         # Time as first dimension
         # only one batch
         embeddings = self.lookup.apply(target_single_char)
         if states is None:
             states = self.dgru.initial_states(batch_size)
-        gru_out = self.dgru.apply(**merge(self.gru_fork.apply(embeddings, as_dict=True),
-                                          {'states': states, 'mask': mask, 'iterate': False}))
+        states_dict = {'states':states[0]}
+        for i in range(1,self.dgru_depth):
+            states_dict['states'+RECURRENTSTACK_SEPARATOR+str(i)] = states[i]
+        gru_out = self.dgru.apply(**merge(self.gru_fork.apply(embeddings, as_dict=True), states_dict,
+                                          {'mask': mask, 'iterate': False}))
         return gru_out
+
+    @single_emit.property('outputs')
+    def single_emit_outputs(self):
+        return ['gru_out' + RECURRENTSTACK_SEPARATOR + str(i) for i in range(self.dgru_depth)]
 
     def get_dim(self, name):
         if name in ['output', 'feedback']:
@@ -155,17 +161,18 @@ class RecurrentWithFork(Initializable):
 class BidirectionalEncoder(Initializable):
     """Encoder of model."""
 
-    def __init__(self, src_vocab_size, embedding_dim, dgru_state_dim, state_dim, encoder_layers, **kwargs):
+    def __init__(self, src_vocab_size, embedding_dim, dgru_state_dim, state_dim, src_dgru_depth,
+                 bidir_encoder_depth, **kwargs):
         super(BidirectionalEncoder, self).__init__(**kwargs)
         self.state_dim = state_dim
         self.dgru_state_dim = dgru_state_dim
-        self.decimator = Decimator(src_vocab_size, embedding_dim, dgru_state_dim, encoder_layers)
+        self.decimator = Decimator(src_vocab_size, embedding_dim, dgru_state_dim, src_dgru_depth)
         self.bidir = Bidirectional(
             RecurrentWithFork(GatedRecurrent(activation=Tanh(), dim=state_dim), dgru_state_dim, name='with_fork'),
             name='bidir0')
 
         self.children = [self.decimator, self.bidir]
-        for layer_n in range(1, encoder_layers):
+        for layer_n in range(1, bidir_encoder_depth):
             self.children.append(copy.deepcopy(self.bidir))
             for child in self.children[-1].children:
                 child.input_dim = 2 * state_dim
@@ -207,16 +214,82 @@ class IGRU(GatedRecurrent):
         gate_inputs : :class:`~tensor.TensorVariable`
             The 2 dimensional matrix of inputs to the gates in the
             shape (batch_size, 2 * dim).
+        input_states : :class:`~tensor.TensorVariable`
+            The 2 dimensional matrix of outputs of decoder in the shape
+            (batch_size, dim), which generated by decoder.
         mask : :class:`~tensor.TensorVariable`
             A 1D binary array in the shape (batch,) which is 1 if there is
-            data available, 0 if not. Assumed to be 1-s only if not given.
+            the charater available, 0 if there is the delimiter.
+        Returns
+        -------
+        output : :class:`~tensor.TensorVariable`
+            Next states of the network.
+        """
+        # put masked states at last may be possible
+        if mask:
+            states = (mask[:, None] * states + (1 - mask[:, None]) * input_states)
+        gate_values = self.gate_activation.apply(
+            states.dot(self.state_to_gates) + gate_inputs)
+        update_values = gate_values[:, :self.dim]
+        reset_values = gate_values[:, self.dim:]
+        #states_reset = (states + input_states) * reset_values / 2
+        states_reset = states * reset_values
+        next_states = self.activation.apply(
+            states_reset.dot(self.state_to_state) + inputs)
+        next_states = (next_states * update_values +
+                       states * (1 - update_values))
+        return next_states
+
+    # using constant initial_states
+    def _allocate(self):
+        self.parameters.append(shared_floatx_nans((self.dim, self.dim),
+                                                  name='state_to_state'))
+        self.parameters.append(shared_floatx_nans((self.dim, 2 * self.dim),
+                                                  name='state_to_gates'))
+        for i in range(2):
+            if self.parameters[i]:
+                add_role(self.parameters[i], WEIGHT)
+
+    @application(outputs=apply.states)
+    def initial_states(self, batch_size, *args, **kwargs):
+        return tensor.zeros((batch_size, self.dim))
+
+
+class UpperIGRU(GatedRecurrent):
+    """ Upper IGRU in interpolator """
+
+    def __init__(self, dim, activation=None, gate_activation=None,
+                 **kwargs):
+        super(UpperIGRU, self).__init__(dim, activation, gate_activation, **kwargs)
+
+    @recurrent(sequences=['mask', 'inputs', 'gate_inputs'],
+               states=['states'], outputs=['states'], contexts=[])
+    def apply(self, inputs, gate_inputs, states, mask=None):
+        """Apply the gated recurrent transition.
+        Parameters
+        ----------
+        states : :class:`~tensor.TensorVariable`
+            The 2 dimensional matrix of current states in the shape
+            (batch_size, dim). Required for `one_step` usage.
+        inputs : :class:`~tensor.TensorVariable`
+            The 2 dimensional matrix of inputs in the shape (batch_size,
+            dim)
+        gate_inputs : :class:`~tensor.TensorVariable`
+            The 2 dimensional matrix of inputs to the gates in the
+            shape (batch_size, 2 * dim).
+        input_states : :class:`~tensor.TensorVariable`
+            The 2 dimensional matrix of outputs of decoder in the shape
+            (batch_size, dim), which generated by decoder.
+        mask : :class:`~tensor.TensorVariable`
+            A 1D binary array in the shape (batch,) which is 1 if there is
+            the charater available, 0 if there is the delimiter.
         Returns
         -------
         output : :class:`~tensor.TensorVariable`
             Next states of the network.
         """
         if mask:
-            states = (mask[:, None] * states + (1 - mask[:, None]) * input_states)
+            states = (mask[:, None] * states + (1 - mask[:, None]) * self.initial_states(mask.shape[0]))
         gate_values = self.gate_activation.apply(
             states.dot(self.state_to_gates) + gate_inputs)
         update_values = gate_values[:, :self.dim]
@@ -231,9 +304,18 @@ class IGRU(GatedRecurrent):
 
 
 class Interpolator(Readout):
-    def __init__(self, vocab_size, embedding_dim, igru_state_dim, emitter=None, feedback_brick=None,
+    def __init__(self, vocab_size, embedding_dim, igru_state_dim, igru_depth, trg_dgru_depth, emitter=None, feedback_brick=None,
                  merge=None, merge_prototype=None, post_merge=None, merged_dim=None, igru=None, **kwargs):
-        self.igru = igru
+        # for compatible
+        if igru_depth == 1:
+            self.igru = IGRU(dim=igru_state_dim)
+        else:
+            self.igru = RecurrentStack([IGRU(dim=igru_state_dim, name='igru')] +
+                                       [UpperIGRU(dim=igru_state_dim, activation=Tanh(), name='upper_igru' + str(i))
+                                        for i in range(1, igru_depth)],
+                                        skip_connections=True)
+        self.igru_depth = igru_depth
+        self.trg_dgru_depth = trg_dgru_depth
         self.lookup = LookupTable(name='embeddings')
         self.vocab_size = vocab_size
         self.igru_state_dim = igru_state_dim
@@ -267,18 +349,29 @@ class Interpolator(Readout):
     def feedback_apply(self, target_char_seq, target_sample_matrix, target_char_aux):
         return self.feedback_brick.apply(target_char_seq, target_sample_matrix, target_char_aux)
 
-    @application(outputs=['single_feedback'])
+    @application
     def single_feedback(self, target_single_char, batch_size, mask=None, states=None):
         return self.feedback_brick.single_emit(target_single_char, batch_size, mask, states)
+
+    @single_feedback.property('outputs')
+    def single_feedback_outputs(self):
+        return ['single_feedback' + RECURRENTSTACK_SEPARATOR + str(i) for i in range(self.trg_dgru_depth)]
 
     @application(outputs=['gru_out', 'readout_chars'])
     def single_readout_gru(self, target_prev_char, target_prev_char_aux, input_states, states):
         embeddings = self.lookup.apply(target_prev_char)
+        states_dict = {'states':states[0]}
+        if self.igru_depth > 1:
+            for i in range(1, self.igru_depth):
+                states_dict['states' + RECURRENTSTACK_SEPARATOR +str(i)] = states[i]
         gru_out = self.igru.apply(
-            **merge(self.gru_fork.apply(embeddings, as_dict=True),
-                    {'mask': target_prev_char_aux, 'input_states': input_states, 'states': states,
+            **merge(self.gru_fork.apply(embeddings, as_dict=True), states_dict,
+                    {'mask': target_prev_char_aux, 'input_states': input_states,
                      'iterate': False}))
-        readout_chars = self.gru_to_softmax.apply(gru_out)
+        if self.igru_depth > 1:
+            readout_chars = self.gru_to_softmax.apply(gru_out[-1])
+        else:
+            readout_chars = self.gru_to_softmax.apply(gru_out)
         return gru_out, readout_chars
 
     @application(outputs=['readout_chars'])
@@ -287,6 +380,8 @@ class Interpolator(Readout):
         gru_out = self.igru.apply(
             **merge(self.gru_fork.apply(embeddings, as_dict=True),
                     {'mask': target_prev_char_aux, 'input_states': input_states}))
+        if self.igru_depth > 1:
+            gru_out = gru_out[-1]
         readout_chars = self.gru_to_softmax.apply(gru_out)
         return readout_chars
 
@@ -294,10 +389,15 @@ class Interpolator(Readout):
 class SequenceGeneratorDCNMT(BaseSequenceGenerator):
     """A more user-friendly interface for :class:`BaseSequenceGenerator`. """
 
-    def __init__(self, trg_space_idx, readout, transition, attention=None, transition_layers=1,
+    def __init__(self, trg_space_idx, readout, transition, attention=None, transition_depth=1, igru_depth=1, trg_dgru_depth=1,
                  add_contexts=True, **kwargs):
         self.trg_space_idx = trg_space_idx
-        self.transition_layers = transition_layers
+        self.transition_depth = transition_depth
+        self.igru_depth = igru_depth
+        self.trg_dgru_depth = trg_dgru_depth
+        self.igru_states_name = ['igru_states'+RECURRENTSTACK_SEPARATOR+str(i) for i in range(self.igru_depth)]
+        self.feedback_name = ['feedback'+RECURRENTSTACK_SEPARATOR+str(i) for i in range(self.trg_dgru_depth)]
+
         normal_inputs = [name for name in transition.apply.sequences
                          if 'mask' not in name]
         kwargs.setdefault('fork', Fork(normal_inputs))
@@ -340,11 +440,15 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
         states = {name: results[name][:-1] for name in self._state_names}
         glimpses = {name: results[name][1:] for name in self._glimpse_names}
 
-        # Compute the cost
         feedback = tensor.roll(feedback, 1, 0)
-        feedback = tensor.set_subtensor(
-            feedback[0],
-            self.readout.single_feedback(self.readout.initial_outputs(batch_size), batch_size))
+        if self.trg_dgru_depth == 1:
+            feedback = tensor.set_subtensor(
+                feedback[0],
+                self.readout.single_feedback(self.readout.initial_outputs(batch_size), batch_size))
+        else:
+            feedback = tensor.set_subtensor(
+                feedback[0],
+                self.readout.single_feedback(self.readout.initial_outputs(batch_size), batch_size)[-1])
 
         decoder_readout_outputs = self.readout.readout(
             feedback=feedback, **dict_union(states, glimpses, contexts))
@@ -353,6 +457,7 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
         resampled_readouts = resampled_representation.dimshuffle([1, 0, 2])
         readouts_chars = self.readout.readout_gru(target_prev_char_seq, target_prev_char_aux, resampled_readouts)
 
+        # Compute the cost
         costs = self.readout.cost(readouts_chars, target_char_seq)
 
         for name, variable in list(glimpses.items()) + list(states.items()):
@@ -386,10 +491,10 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
         # masks in context are optional (e.g. `attended_mask`)
         contexts = dict_subset(kwargs, self._context_names, must_have=False)
         glimpses = dict_subset(kwargs, self._glimpse_names)
-        feedback = dict_subset(kwargs, ['feedback'])['feedback']
-        gru_out = dict_subset(kwargs, ['gru_out'])['gru_out']
+        feedback = dict_subset(kwargs, self.feedback_name)
         readout_feedback = dict_subset(kwargs, ['readout_feedback'])['readout_feedback']
         batch_size = outputs.shape[0]
+        igru_states = dict_subset(kwargs, self.igru_states_name)
 
         next_glimpses = self.transition.take_glimpses(
             as_dict=True, **dict_union(states, glimpses, contexts))
@@ -399,16 +504,18 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
             **dict_union(states, next_glimpses, contexts))
 
         next_char_aux = 1 - tensor.eq(outputs, 0) - tensor.eq(outputs, self.trg_space_idx)
-        next_gru_out, readout_chars = self.readout.single_readout_gru(outputs, next_char_aux, next_readouts, gru_out)
+        next_igru_states, readout_chars = self.readout.single_readout_gru(outputs, next_char_aux, next_readouts,
+                                                                          [igru_states[self.igru_states_name[i]] for i in range(self.igru_depth)])
         next_outputs = self.readout.emit(readout_chars)
         next_costs = self.readout.cost(readout_chars, next_outputs)
 
         update_next = tensor.eq(next_outputs, self.trg_space_idx)
         next_char_mask = 1 - update_next
         update_next = update_next[:, None]
-        next_readout_feedback = (1 - update_next) * readout_feedback + update_next * feedback
+        next_readout_feedback = (1 - update_next) * readout_feedback + update_next * feedback[self.feedback_name[-1]]
 
-        next_feedback = self.readout.single_feedback(next_outputs, batch_size, next_char_mask, feedback)
+        next_feedback = self.readout.single_feedback(next_outputs, batch_size, next_char_mask,
+                                                     [feedback[self.feedback_name[i]] for i in range(self.trg_dgru_depth)])
 
         next_inputs = (self.fork.apply(next_readout_feedback, as_dict=True)
                        if self.fork else {'feedback': next_readout_feedback})
@@ -417,16 +524,25 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
             **dict_union(next_inputs, states, next_glimpses, contexts))
 
         next_states[0] = update_next * next_states[0] + (1 - update_next) * states['states']
-        for i in range(1, self.transition_layers):
-            next_states[i] = update_next * next_states[i] + (1 - update_next) * states['states#' + str(i)]
+        for i in range(1, self.transition_depth):
+            next_states[i] = update_next * next_states[i] + (1 - update_next) * states['states' + RECURRENTSTACK_SEPARATOR + str(i)]
 
         next_glimpses['weights'] = update_next * next_glimpses['weights'] + (1 - update_next) * glimpses['weights']
         next_glimpses['weighted_averages'] = update_next * next_glimpses['weighted_averages'] + \
                                              (1 - update_next) * glimpses['weighted_averages']
+        # combine all updates
+        next_all = list(next_states) + [next_outputs] + list(next_glimpses.values())
+        if self.trg_dgru_depth > 1:
+            next_all += list(next_feedback)
+        else:
+            next_all += [next_feedback]
+        if self.igru_depth > 1:
+            next_all += list(next_igru_states)
+        else:
+            next_all += [next_igru_states]
+        next_all += [next_readout_feedback] + [next_costs]
 
-        return (list(next_states) + [next_outputs] +
-                list(next_glimpses.values()) + [next_feedback] + [next_gru_out] +
-                [next_readout_feedback] + [next_costs])
+        return (next_all)
 
     @generate.delegate
     def generate_delegate(self):
@@ -435,16 +551,17 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
     @generate.property('outputs')
     def generate_outputs(self):
         return self._state_names + ['outputs'] + self._glimpse_names + \
-               ['feedback', 'gru_out', 'readout_feedback', 'costs']
+              self.feedback_name + self.igru_states_name + ['readout_feedback', 'cost']
 
     @generate.property('states')
     def generate_states(self):
-        return self._state_names + ['outputs'] + self._glimpse_names + ['feedback', 'gru_out', 'readout_feedback']
+        return self._state_names + ['outputs'] + self._glimpse_names + \
+            self.feedback_name + self.igru_states_name + ['readout_feedback']
 
     def get_dim(self, name):
         if name in (self._state_names + self._context_names + self._glimpse_names):
             return self.transition.get_dim(name)
-        elif name == 'outputs' or name == 'feedback' or name == 'readout_feedback' or name == 'gru_out':
+        elif name == 'outputs' or name in self.feedback_name or name == 'readout_feedback' or name in self.igru_states_name:
             return self.readout.get_dim('outputs')
         return super(BaseSequenceGenerator, self).get_dim(name)
 
@@ -452,13 +569,27 @@ class SequenceGeneratorDCNMT(BaseSequenceGenerator):
     def initial_states(self, batch_size, *args, **kwargs):
         # TODO: support dict of outputs for application methods
         # to simplify this code.
+        igru_initial_states = self.readout.initial_igru_outputs(batch_size)
+        if self.igru_depth == 1:
+            igru_initial_states_dict = {self.igru_states_name[0]:igru_initial_states}
+        else:
+            igru_initial_states_dict = {self.igru_states_name[i]:igru_initial_states[i]
+                                        for i in range(self.igru_depth)}
+
+        initial_outputs=self.readout.initial_outputs(batch_size)
+        feedback = self.readout.single_feedback(initial_outputs, batch_size)
+        if self.trg_dgru_depth == 1:
+            feedback_dict = {self.feedback_name[0]:feedback, 'readout_feedback':feedback}
+        else:
+            feedback_dict = {'readout_feedback':feedback[-1]}
+            feedback_dict.update({self.feedback_name[i]:feedback[i] for i in range(self.trg_dgru_depth)})
+
         state_dict = dict(
             self.transition.initial_states(
                 batch_size, as_dict=True, *args, **kwargs),
-            outputs=self.readout.initial_outputs(batch_size),
-            feedback=self.readout.single_feedback(self.readout.initial_outputs(batch_size), batch_size),
-            gru_out=self.readout.initial_igru_outputs(batch_size),
-            readout_feedback=self.readout.single_feedback(self.readout.initial_outputs(batch_size), batch_size))
+            outputs=initial_outputs)
+        state_dict.update(feedback_dict)
+        state_dict.update(igru_initial_states_dict)
         return [state_dict[state_name]
                 for state_name in self.generate.states]
 
@@ -504,12 +635,14 @@ class GRUInitialState(GatedRecurrent):
 class Decoder(Initializable):
     """Decoder of dcnmt model."""
 
-    def __init__(self, vocab_size, embedding_dim, dgru_state_dim, state_dim,
-                 representation_dim, transition_layers, trg_space_idx, trg_bos, theano_seed=None, **kwargs):
+    def __init__(self, vocab_size, embedding_dim, dgru_state_dim, igru_state_dim, state_dim,
+                 representation_dim, transition_depth, trg_igru_depth, trg_dgru_depth, trg_space_idx, trg_bos,
+                 theano_seed=None, **kwargs):
         super(Decoder, self).__init__(**kwargs)
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.dgru_state_dim = dgru_state_dim
+        self.igru_state_dim = igru_state_dim
         self.state_dim = state_dim
         self.trg_space_idx = trg_space_idx
         self.representation_dim = representation_dim
@@ -519,7 +652,7 @@ class Decoder(Initializable):
         self.transition = RecurrentStack(
             [GRUInitialState(attended_dim=state_dim, dim=state_dim, activation=Tanh(), name='decoder_gru_withinit')] +
             [GatedRecurrent(dim=state_dim, activation=Tanh(), name='decoder_gru' + str(i))
-             for i in range(1, transition_layers)], skip_connections=True)
+             for i in range(1, transition_depth)], skip_connections=True)
 
         # Initialize the attention mechanism
         self.attention = SequenceContentAttention(
@@ -527,18 +660,26 @@ class Decoder(Initializable):
             attended_dim=representation_dim,
             match_dim=state_dim, name="attention")
 
+        # for compatible
+        if self.igru_state_dim == self.state_dim:
+            post_merge_layer = [Identity().apply]
+        else:
+            post_merge_layer = [Linear(input_dim=self.state_dim,
+                                      output_dim=self.igru_state_dim).apply,
+                                Tanh().apply]
+
         self.interpolator = Interpolator(
             vocab_size=vocab_size,
             embedding_dim=embedding_dim,
-            igru_state_dim=state_dim,
+            igru_state_dim=igru_state_dim,
+            igru_depth=trg_igru_depth,
+            trg_dgru_depth=trg_dgru_depth,
             source_names=['states', 'feedback', self.attention.take_glimpses.outputs[0]],
             readout_dim=self.vocab_size,
             emitter=SoftmaxEmitter(initial_output=trg_bos, theano_seed=theano_seed),
-            igru=IGRU(dim=state_dim),
-            feedback_brick=Decimator(vocab_size, embedding_dim, self.dgru_state_dim, 1),
-            post_merge=InitializableFeedforwardSequence(
-                [Identity().apply]),
-            merged_dim=state_dim)
+            feedback_brick=Decimator(vocab_size, embedding_dim, self.dgru_state_dim, trg_dgru_depth),
+            post_merge=InitializableFeedforwardSequence(post_merge_layer),
+            merged_dim=igru_state_dim)
 
         # Build sequence generator accordingly
         self.sequence_generator = SequenceGeneratorDCNMT(
@@ -546,7 +687,9 @@ class Decoder(Initializable):
             readout=self.interpolator,
             transition=self.transition,
             attention=self.attention,
-            transition_layers=transition_layers,
+            transition_depth=transition_depth,
+            igru_depth=trg_igru_depth,
+            trg_dgru_depth=trg_dgru_depth,
             fork=Fork([name for name in self.transition.apply.sequences
                        if name != 'mask'], prototype=Linear())
         )
